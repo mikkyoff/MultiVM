@@ -27,6 +27,17 @@
         .tab.active { background: #2962ff; border-color: #2962ff; color: white; }
         .tab:hover { border-color: #2962ff; }
 
+        #slotHealth {
+            display: flex; gap: 6px; flex-wrap: wrap;
+            padding: 6px 18px; background: #161b22;
+            border-bottom: 1px solid #2a2e39; font-size: 11px;
+        }
+        #slotHealth .pill {
+            padding: 2px 8px; border-radius: 10px; font-size: 10px;
+            font-weight: 600; letter-spacing: 0.5px;
+            font-family: ui-monospace, monospace;
+        }
+
         #grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
@@ -46,7 +57,7 @@
             font-size: 12px;
         }
         .cell-head .asset { font-weight: 700; font-size: 13px; }
-        .cell-head .slot { color: #787b86; font-size: 10px; }
+        .cell-head .slot { color: #787b86; font-size: 10px; font-family: ui-monospace, monospace; }
         .chart { width: 100%; height: 240px; }
         .cell-foot {
             display: grid; grid-template-columns: repeat(4, 1fr);
@@ -72,6 +83,7 @@
         <div id="tabs"></div>
         <div id="status"><span class="badge warn">Connecting...</span></div>
     </div>
+    <div id="slotHealth"></div>
     <div id="grid"></div>
 
     <script>
@@ -79,6 +91,7 @@
     const tabs = document.getElementById('tabs');
     const statusEl = document.getElementById('status');
     const titleEl = document.getElementById('title');
+    const healthEl = document.getElementById('slotHealth');
 
     const charts = {};   // asset -> { chart, candleSeries, bbU, bbM, bbL, ema }
     let allAssets = [];
@@ -88,7 +101,7 @@
     const fmt = (n, d = 5) => (n === null || n === undefined || isNaN(n)) ? '—' : Number(n).toFixed(d);
     const fmtPct = (n) => (n === null || n === undefined || isNaN(n)) ? '—' : Number(n).toFixed(1) + '%';
 
-    function makeCell(asset, slotId) {
+    function makeCell(asset, slotId, ssidFp) {
         const cell = document.createElement('div');
         cell.className = 'cell';
         cell.dataset.asset = asset;
@@ -96,7 +109,7 @@
         cell.innerHTML = `
             <div class="cell-head">
                 <span class="asset">${asset}</span>
-                <span class="slot">slot ${slotId}</span>
+                <span class="slot">slot ${slotId} · ${ssidFp}</span>
             </div>
             <div class="chart" id="chart-${asset}"></div>
             <div class="cell-foot">
@@ -173,18 +186,17 @@
 
             if (!initialized) {
                 titleEl.textContent = `Multi-Stream Dashboard — VM ${data.vm_role} (${data.timeframe}s)`;
-                // Create cells once we know the assets
+
                 const allTabs = ['ALL'];
-                let anyConn = false;
                 for (const slot of data.data.slots) {
+                    const ssidFp = (slot.stats && slot.stats.ssid_fingerprint) || '—';
                     allTabs.push(String(slot.slot_id));
-                    if (slot.stats.connected) anyConn = true;
-                    for (const asset of slot.assets) {
+                    for (const asset of Object.keys(slot.assets)) {
                         allAssets.push(asset);
-                        makeCell(asset, slot.slot_id);
+                        makeCell(asset, slot.slot_id, ssidFp);
                     }
                 }
-                // Build tabs
+
                 tabs.innerHTML = '';
                 allTabs.forEach(t => {
                     const el = document.createElement('div');
@@ -202,10 +214,18 @@
             }
 
             let connectedCount = 0;
-            let totalSlots = 0;
+            const totalSlots = data.data.slots.length;
+
+            // Slot health pills
+            healthEl.innerHTML = data.data.slots.map(s => {
+                const cls = s.stats.connected ? 'ok' : 'err';
+                const fp = (s.stats && s.stats.ssid_fingerprint) || '—';
+                const tps = s.stats.slot_tick_rate_60s ? s.stats.slot_tick_rate_60s.toFixed(2) : '0.00';
+                const assetCount = Object.keys(s.assets).length;
+                return `<span class="pill ${cls}" title="${assetCount} assets · ${tps} ticks/s">${fp}</span>`;
+            }).join('');
 
             for (const slot of data.data.slots) {
-                totalSlots++;
                 if (slot.stats.connected) connectedCount++;
 
                 for (const [asset, snap] of Object.entries(slot.assets)) {
@@ -239,31 +259,38 @@
                         });
                     }
 
-                    // Fit only the first time
                     if (!c._fitted && candles.length > 0) {
                         c.chart.timeScale().fitContent();
                         c._fitted = true;
                     }
 
-                    // Metrics
                     const rsiEl = document.getElementById(`rsi-${asset}`);
-                    rsiEl.textContent = fmt(ind.rsi, 1);
-                    rsiEl.className = 'v ' + (ind.rsi == null ? 'neutral' :
-                        ind.rsi >= 70 ? 'neg' : ind.rsi <= 30 ? 'pos' : 'neutral');
+                    if (rsiEl) {
+                        rsiEl.textContent = fmt(ind.rsi, 1);
+                        rsiEl.className = 'v ' + (ind.rsi == null ? 'neutral' :
+                            ind.rsi >= 70 ? 'neg' : ind.rsi <= 30 ? 'pos' : 'neutral');
+                    }
 
-                    document.getElementById(`ema-${asset}`).textContent = fmt(ind.ema, 5);
-                    document.getElementById(`ema-${asset}`).className = 'v ' +
-                        (ind.ema_signal === 'ABOVE' ? 'pos' : ind.ema_signal === 'BELOW' ? 'neg' : 'neutral');
+                    const emaEl = document.getElementById(`ema-${asset}`);
+                    if (emaEl) {
+                        emaEl.textContent = fmt(ind.ema, 5);
+                        emaEl.className = 'v ' +
+                            (ind.ema_signal === 'ABOVE' ? 'pos' : ind.ema_signal === 'BELOW' ? 'neg' : 'neutral');
+                    }
 
                     const up = ind.bb_pct_to_upper;
                     const upEl = document.getElementById(`bbu-${asset}`);
-                    upEl.textContent = fmtPct(up);
-                    upEl.className = 'v ' + (up >= 40 ? 'pos' : up == null ? 'neutral' : 'warn-y');
+                    if (upEl) {
+                        upEl.textContent = fmtPct(up);
+                        upEl.className = 'v ' + (up >= 40 ? 'pos' : up == null ? 'neutral' : 'warn-y');
+                    }
 
                     const lo = ind.bb_pct_to_lower;
                     const loEl = document.getElementById(`bbl-${asset}`);
-                    loEl.textContent = fmtPct(lo);
-                    loEl.className = 'v ' + (lo >= 40 ? 'pos' : lo == null ? 'neutral' : 'warn-y');
+                    if (loEl) {
+                        loEl.textContent = fmtPct(lo);
+                        loEl.className = 'v ' + (lo >= 40 ? 'pos' : lo == null ? 'neutral' : 'warn-y');
+                    }
                 }
             }
 
