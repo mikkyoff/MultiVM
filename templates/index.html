@@ -116,4 +116,178 @@
                 timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2a2e39' },
                 rightPriceScale: { borderColor: '#2a2e39' },
                 handleScale: { axisPressedMouseMove: false },
-                handleScroll: { pressedMouseMove: false, mouseWheel: false,
+                handleScroll: { pressedMouseMove: false, mouseWheel: false, horzTouchDrag: false, vertTouchDrag: false },
+            }
+        );
+        const candleSeries = chart.addCandlestickSeries({
+            upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+            wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+        });
+        const bbU = chart.addLineSeries({ color: '#2962ff', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+        const bbM = chart.addLineSeries({ color: '#f0a500', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+        const bbL = chart.addLineSeries({ color: '#2962ff', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+        const ema = chart.addLineSeries({ color: '#e91e63', lineWidth: 2, priceLineVisible: false });
+
+        charts[asset] = { chart, candleSeries, bbU, bbM, bbL, ema };
+    }
+
+    function buildLines(candles, cfg) {
+        const closes = [];
+        const bbU = [], bbM = [], bbL = [], emaD = [];
+        let e = null;
+        const k = 2 / (cfg.ema_period + 1);
+        for (let i = 0; i < candles.length; i++) {
+            const c = candles[i];
+            closes.push(c.close);
+            if (closes.length >= cfg.bb_period) {
+                const win = closes.slice(-cfg.bb_period);
+                const mean = win.reduce((a, b) => a + b, 0) / cfg.bb_period;
+                const v = win.reduce((a, b) => a + (b - mean) ** 2, 0) / cfg.bb_period;
+                const sd = Math.sqrt(v);
+                bbU.push({ time: c.time, value: mean + cfg.bb_std * sd });
+                bbM.push({ time: c.time, value: mean });
+                bbL.push({ time: c.time, value: mean - cfg.bb_std * sd });
+            }
+            if (closes.length === cfg.ema_period) {
+                e = closes.slice(0, cfg.ema_period).reduce((a, b) => a + b, 0) / cfg.ema_period;
+                emaD.push({ time: c.time, value: e });
+            } else if (closes.length > cfg.ema_period && e !== null) {
+                e = c.close * k + e * (1 - k);
+                emaD.push({ time: c.time, value: e });
+            }
+        }
+        return { bbU, bbM, bbL, emaD };
+    }
+
+    function applyFilter() {
+        document.querySelectorAll('.cell').forEach(cell => {
+            const show = activeFilter === 'ALL' || cell.dataset.slot === String(activeFilter);
+            cell.style.display = show ? 'flex' : 'none';
+        });
+    }
+
+    async function tick() {
+        try {
+            const res = await fetch('/api/candles');
+            const data = await res.json();
+
+            if (!initialized) {
+                titleEl.textContent = `Multi-Stream Dashboard — VM ${data.vm_role} (${data.timeframe}s)`;
+                // Create cells once we know the assets
+                const allTabs = ['ALL'];
+                let anyConn = false;
+                for (const slot of data.data.slots) {
+                    allTabs.push(String(slot.slot_id));
+                    if (slot.stats.connected) anyConn = true;
+                    for (const asset of slot.assets) {
+                        allAssets.push(asset);
+                        makeCell(asset, slot.slot_id);
+                    }
+                }
+                // Build tabs
+                tabs.innerHTML = '';
+                allTabs.forEach(t => {
+                    const el = document.createElement('div');
+                    el.className = 'tab' + (t === 'ALL' ? ' active' : '');
+                    el.textContent = t === 'ALL' ? 'All Slots' : `Slot ${t}`;
+                    el.onclick = () => {
+                        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+                        el.classList.add('active');
+                        activeFilter = t;
+                        applyFilter();
+                    };
+                    tabs.appendChild(el);
+                });
+                initialized = true;
+            }
+
+            let connectedCount = 0;
+            let totalSlots = 0;
+
+            for (const slot of data.data.slots) {
+                totalSlots++;
+                if (slot.stats.connected) connectedCount++;
+
+                for (const [asset, snap] of Object.entries(slot.assets)) {
+                    const c = charts[asset];
+                    if (!c) continue;
+
+                    const candles = snap.candles.map(x => ({
+                        time: x.time, open: x.open, high: x.high, low: x.low, close: x.close,
+                    }));
+                    const ind = snap.indicators || {};
+                    const cfg = {
+                        bb_period: ind.bb_period || 20,
+                        bb_std: ind.bb_std || 2,
+                        ema_period: ind.ema_period || 6,
+                    };
+                    const lines = buildLines(candles, cfg);
+
+                    c.candleSeries.setData(candles);
+                    c.bbU.setData(lines.bbU);
+                    c.bbM.setData(lines.bbM);
+                    c.bbL.setData(lines.bbL);
+                    c.ema.setData(lines.emaD);
+
+                    if (snap.forming) {
+                        c.candleSeries.update({
+                            time: snap.forming.time,
+                            open: snap.forming.open,
+                            high: snap.forming.high,
+                            low: snap.forming.low,
+                            close: snap.forming.close,
+                        });
+                    }
+
+                    // Fit only the first time
+                    if (!c._fitted && candles.length > 0) {
+                        c.chart.timeScale().fitContent();
+                        c._fitted = true;
+                    }
+
+                    // Metrics
+                    const rsiEl = document.getElementById(`rsi-${asset}`);
+                    rsiEl.textContent = fmt(ind.rsi, 1);
+                    rsiEl.className = 'v ' + (ind.rsi == null ? 'neutral' :
+                        ind.rsi >= 70 ? 'neg' : ind.rsi <= 30 ? 'pos' : 'neutral');
+
+                    document.getElementById(`ema-${asset}`).textContent = fmt(ind.ema, 5);
+                    document.getElementById(`ema-${asset}`).className = 'v ' +
+                        (ind.ema_signal === 'ABOVE' ? 'pos' : ind.ema_signal === 'BELOW' ? 'neg' : 'neutral');
+
+                    const up = ind.bb_pct_to_upper;
+                    const upEl = document.getElementById(`bbu-${asset}`);
+                    upEl.textContent = fmtPct(up);
+                    upEl.className = 'v ' + (up >= 40 ? 'pos' : up == null ? 'neutral' : 'warn-y');
+
+                    const lo = ind.bb_pct_to_lower;
+                    const loEl = document.getElementById(`bbl-${asset}`);
+                    loEl.textContent = fmtPct(lo);
+                    loEl.className = 'v ' + (lo >= 40 ? 'pos' : lo == null ? 'neutral' : 'warn-y');
+                }
+            }
+
+            if (connectedCount === 0) {
+                statusEl.innerHTML = '<span class="badge err">ALL SLOTS DOWN</span>';
+            } else if (connectedCount < totalSlots) {
+                statusEl.innerHTML = `<span class="badge warn">${connectedCount}/${totalSlots} slots up</span>`;
+            } else {
+                statusEl.innerHTML = `<span class="badge ok">${connectedCount}/${totalSlots} slots live</span>`;
+            }
+        } catch (e) {
+            statusEl.innerHTML = `<span class="badge err">CLIENT: ${e.message}</span>`;
+        }
+    }
+
+    tick();
+    setInterval(tick, 1000);
+
+    window.addEventListener('resize', () => {
+        Object.values(charts).forEach(c => {
+            const el = c.chart.chartElement();
+            c.chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+        });
+    });
+    </script>
+</body>
+</html>
