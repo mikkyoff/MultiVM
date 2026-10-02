@@ -35,7 +35,7 @@ elif VM_ROLE == "B":
     # LIVE
     SLOTS_CONFIG = [
         (os.getenv("SSID_VM2_SLOT1"), ["UKBrent_otc", "USCrude_otc", "JPN225_otc"]),
-        (os.getenv("SSID_VM2_SLOT2"), ["SP500_otc", "XOM_otc", "XAGUSD_otc"]),
+        (os.getenv("SSID_VM2_SLOT2"), ["SP500_otc", "BITB_otc", "XAGUSD_otc"]),
         (os.getenv("SSID_VM2_SLOT3"), ["XAUUSD_otc", "XNGUSD_otc"]),
     ]
 else:
