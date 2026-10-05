@@ -22,7 +22,7 @@ from indicators import recompute
 from perf import SlotStats, AssetStats
 
 
-TIMEFRAME_SECONDS = 60
+TIMEFRAME_SECONDS = 900
 HISTORY_CANDLES = 150
 MAX_CANDLES = 100        # reduced from 300 as requested
 
