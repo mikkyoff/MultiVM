@@ -40,7 +40,7 @@ if VM_ROLE == "A":
     SLOTS_CONFIG = [
         (os.getenv("SSID_VM1_SLOT1"), ["MARA_otc", "GME_otc", "PLTR_otc"], _mode("SSID_VM1_SLOT1_MODE")),
         (os.getenv("SSID_VM1_SLOT2"), ["EURRUB_otc", "LINK_otc", "SOL-USD_otc"], _mode("SSID_VM1_SLOT2_MODE")),
-        (os.getenv("SSID_VM1_SLOT3"), ["MATIC_otc", "#XOM_otc"], _mode("SSID_VM1_SLOT3_MODE")),
+        (os.getenv("SSID_VM1_SLOT3"), ["MATIC_otc", "TON-USD_otc"], _mode("SSID_VM1_SLOT3_MODE")),
     ]
 elif VM_ROLE == "B":
     # VM B: test each mode
@@ -48,7 +48,7 @@ elif VM_ROLE == "B":
     #   slot 2 → time_aligned (developer suggestion)
     #   slot 3 → historical_ticks (user workaround)
     SLOTS_CONFIG = [
-        (os.getenv("SSID_VM2_SLOT1"), ["UKBrent_otc", "USCrude_otc", "JPN225_otc"], _mode("SSID_VM2_SLOT1_MODE", "ticks")),
+        (os.getenv("SSID_VM2_SLOT1"), ["UKBrent_otc", "USCrude_otc", "#XOM_otc"], _mode("SSID_VM2_SLOT1_MODE", "ticks")),
         (os.getenv("SSID_VM2_SLOT2"), ["SP500_otc", "BITB_otc", "XAGUSD_otc"], _mode("SSID_VM2_SLOT2_MODE", "time_aligned")),
         (os.getenv("SSID_VM2_SLOT3"), ["XAUUSD_otc", "XNGUSD_otc"], _mode("SSID_VM2_SLOT3_MODE", "historical_ticks")),
     ]
@@ -76,4 +76,59 @@ def _memory_maintenance():
         try:
             gc.collect()
             try:
-                libc
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+                print("[maint] gc + malloc_trim done")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[maint] error: {e}")
+        time.sleep(3600)
+
+def _startup():
+    manager.start(startup_delay_secs=STARTUP_DELAY_SECS)
+    threading.Thread(target=_perf_sampler, daemon=True, name="perf-sampler").start()
+    threading.Thread(target=_memory_maintenance, daemon=True, name="mem-maint").start()
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/candles")
+def get_candles():
+    return jsonify({
+        "vm_role": VM_ROLE,
+        "timeframe": TIMEFRAME_SECONDS,
+        "server_time": int(time.time()),
+        "data": manager.snapshot_all(),
+    })
+
+
+@app.route("/api/perf")
+def get_perf():
+    manager.refresh_rates()
+    return jsonify({
+        "vm_role": VM_ROLE,
+        "uptime_seconds": int(time.time() - _START_TS),
+        "data": manager.snapshot_stats(),
+    })
+
+
+@app.route("/api/perf/history")
+def get_perf_history():
+    return jsonify({"vm_role": VM_ROLE, "samples": perf_history.snapshot()})
+
+
+@app.route("/api/health")
+def health():
+    return jsonify({"status": "ok", "vm_role": VM_ROLE})
+
+
+_START_TS = time.time()
+_startup()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
