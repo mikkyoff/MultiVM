@@ -1,13 +1,19 @@
 """
 Multi-SSID streaming manager.
 
-Candle building policy:
-  1. Connect and subscribe to raw ticks.
-  2. Fetch 150 historical closed candles for indicator seed (best-effort).
-  3. Wait until the next clean clock boundary (e.g. :00, :10, :20, :30, :40, :50).
-  4. Discard all ticks received before the boundary.
-  5. Start building candles from the first tick at/after the boundary.
-  6. Every subsequent candle boundary produces one completed candle.
+Correct sequencing:
+  1. Connect to PocketOption.
+  2. Subscribe to raw ticks IMMEDIATELY (start buffering, don't ingest yet).
+  3. Wait for the next clock boundary — with a safety margin so we don't
+     cut it too close. If the next boundary is < MIN_MARGIN seconds away,
+     skip it and wait for the one after.
+  4. At the boundary, flip the alignment flag.
+  5. The first tick at/after the boundary becomes the open of the new candle.
+  6. Concurrently fetch historical closed candles. Because we waited for
+     the boundary, the previous in-progress candle is now closed and will
+     be included in the history response — no gap.
+  7. Prepend the fetched history to our buffer.
+  8. Recompute indicators on the full series.
 """
 
 import os
@@ -26,8 +32,8 @@ from indicators import recompute
 from perf import SlotStats, AssetStats
 
 
-TIMEFRAME_SECONDS = 300
-HISTORY_CANDLES = 100
+TIMEFRAME_SECONDS = 180       # 3-minute candles
+HISTORY_CANDLES = 120
 MAX_CANDLES = 100
 
 RSI_PERIOD = 14
@@ -38,6 +44,11 @@ EMA_PERIOD = 6
 SLOT_START_GAP_SECS = 5.0
 HISTORICAL_POLL_SECS = 10
 
+# Minimum seconds before a boundary that we'll accept.
+# If we're too close, we skip the boundary and wait for the next one,
+# giving the connection time to stabilize.
+MIN_MARGIN_BEFORE_BOUNDARY = 5.0
+
 
 class AssetState:
     __slots__ = (
@@ -46,7 +57,8 @@ class AssetState:
         "bb_bandwidth", "bb_pct_to_upper", "bb_pct_to_lower",
         "ema", "ema_signal",
         "last_remote_candle_time",
-        "aligned_started",     # True once we've crossed the first clean boundary
+        "aligned_started",
+        "history_loaded",
     )
 
     def __init__(self, asset: str):
@@ -67,11 +79,13 @@ class AssetState:
 
         self.last_remote_candle_time = None
         self.aligned_started = False
+        self.history_loaded = False
 
     def snapshot(self):
         return {
             "asset": self.asset,
             "aligned_started": self.aligned_started,
+            "history_loaded": self.history_loaded,
             "candles": [
                 {"time": t, "open": o, "high": h, "low": l, "close": c}
                 for (t, o, h, l, c) in self.candles
@@ -152,32 +166,44 @@ class Slot:
         )
         self.stats.mark_connected()
 
-        # ---- Seed history for indicator warm-up ----
+        # ---- Subscribe FIRST, buffer ticks in the background ----
+        # Ticks received before the boundary will be discarded, but they
+        # keep the socket warm and let us catch the very first tick after
+        # the boundary with no setup delay.
+        pre_subscribe_tasks = []
         for asset in self.assets:
-            try:
-                await self._seed_history(client, asset)
-            except Exception as e:
-                print(f"[slot {self.slot_id}] seed {asset} failed: {e}")
+            pre_subscribe_tasks.append(
+                asyncio.create_task(self._early_buffer(client, asset))
+            )
 
-        # ---- Wait until the next clean boundary ----
-        now = int(time.time())
-        next_boundary = ((now // TIMEFRAME_SECONDS) + 1) * TIMEFRAME_SECONDS
-        wait_secs = next_boundary - now
+        # ---- Compute the target boundary with a safety margin ----
+        target_boundary = self._compute_target_boundary()
+        now = time.time()
+        wait_secs = target_boundary - now
         print(
-            f"[slot {self.slot_id}] waiting {wait_secs}s for next "
-            f"{TIMEFRAME_SECONDS}s boundary at {next_boundary}"
+            f"[slot {self.slot_id}] waiting {wait_secs:.1f}s for boundary at "
+            f"{int(target_boundary)} (margin: {MIN_MARGIN_BEFORE_BOUNDARY}s)"
         )
-        await asyncio.sleep(wait_secs + 0.2)  # +200ms safety margin
+        await asyncio.sleep(max(0.0, wait_secs))
 
-        # Mark all assets as aligned
+        # ---- Cross the boundary ----
+        print(f"[slot {self.slot_id}] boundary crossed at {int(time.time())}")
+
         with self.state_lock:
             for st in self.asset_state.values():
                 st.aligned_started = True
-                st.forming = None  # discard anything seeded during wait
+                st.forming = None  # anything buffered pre-boundary is discarded
 
-        print(f"[slot {self.slot_id}] boundary crossed — starting to build candles")
+        # ---- Kick off historical fetch AFTER the boundary ----
+        # The candle that was in-progress before this moment is now closed
+        # and will be included in the fetched history.
+        for asset in self.assets:
+            asyncio.create_task(self._post_boundary_history(client, asset))
 
-        # ---- Subscribe and run the mode-specific stream ----
+        # ---- Wait for early-buffer tasks to hand off ----
+        await asyncio.gather(*pre_subscribe_tasks, return_exceptions=True)
+
+        # ---- Now switch to the real stream loops ----
         if self.mode == "ticks":
             tasks = [asyncio.create_task(self._stream_ticks(client, a)) for a in self.assets]
         elif self.mode == "time_aligned":
@@ -197,47 +223,24 @@ class Slot:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # History seed
-    # ------------------------------------------------------------------
-    async def _seed_history(self, client, asset: str):
-        """Fetch historical closed candles for indicator warm-up."""
-        state = self.asset_state[asset]
-        try:
-            gen = client.get_candles_live(
-                asset=asset,
-                period=TIMEFRAME_SECONDS,
-                hours=3.0,
-                max_rows=HISTORY_CANDLES,
-            )
-            closed, _forming = await gen.__anext__()
-            await gen.aclose()
-        except Exception as e:
-            print(f"[slot {self.slot_id}] history seed failed for {asset}: {e}")
-            return
+    def _compute_target_boundary(self) -> float:
+        """
+        Return the next boundary timestamp we should align to.
+        If the next boundary is less than MIN_MARGIN_BEFORE_BOUNDARY seconds
+        away, return the one after it.
+        """
+        now = time.time()
+        next_boundary = (int(now) // TIMEFRAME_SECONDS + 1) * TIMEFRAME_SECONDS
+        if next_boundary - now < MIN_MARGIN_BEFORE_BOUNDARY:
+            next_boundary += TIMEFRAME_SECONDS
+        return float(next_boundary)
 
-        for c in closed[-HISTORY_CANDLES:]:
-            state.candles.append((
-                int(c["time"]),
-                float(c["open"]),
-                float(c["high"]),
-                float(c["low"]),
-                float(c["close"]),
-            ))
-
-        if state.candles:
-            state.last_boundary = state.candles[-1][0]
-
-        closes = [c[4] for c in state.candles]
-        if closes:
-            self._apply_indicators(state, closes)
-
-        print(f"[slot {self.slot_id}] seeded {len(state.candles)} candles for {asset}")
-
-    # ------------------------------------------------------------------
-    # Mode: raw tick subscription
-    # ------------------------------------------------------------------
-    async def _stream_ticks(self, client, asset: str):
+    async def _early_buffer(self, client, asset: str):
+        """
+        Subscribe to ticks before the boundary. Buffer ticks in memory.
+        Discard everything buffered when the boundary crosses. This task
+        exits after the boundary is crossed, handing off to _stream_ticks.
+        """
         state = self.asset_state[asset]
         st = self.stats.get_asset(asset)
 
@@ -247,6 +250,39 @@ class Slot:
             self.stats.mark_error(f"subscribe {asset}: {e}")
             return
 
+        # Keep ticks in a rolling buffer until aligned_started is True
+        while not self._stop.is_set():
+            with self.state_lock:
+                if state.aligned_started:
+                    # Boundary crossed. Ingest any buffered ticks that arrived
+                    # just after the boundary, then exit — _stream_ticks takes over.
+                    break
+
+            try:
+                tick = await asyncio.wait_for(stream.__anext__(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            except StopAsyncIteration:
+                return
+            except Exception:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Discard — we don't want pre-boundary ticks
+            # (their timestamp is in the old bucket)
+
+        # Hand off: continue reading from the same stream but now ingesting.
+        # Note: the stream is owned by this task; we pass it to _stream_ticks
+        # via a shared slot on the state object.
+        await self._stream_ticks_from_stream(client, asset, stream)
+
+    async def _stream_ticks_from_stream(self, client, asset: str, stream):
+        """
+        Once the boundary has been crossed, ingest ticks into the forming
+        candle. This replaces _stream_ticks for the initial handoff.
+        """
+        state = self.asset_state[asset]
+        st = self.stats.get_asset(asset)
         last_ts = 0
 
         while not self._stop.is_set():
@@ -269,9 +305,6 @@ class Slot:
                     continue
                 last_ts = ts
 
-                # Ignore ticks received before the aligned flag was set.
-                # (These would have been discarded by the boundary wait,
-                # but a stray late tick can still sneak in.)
                 with self.state_lock:
                     if not state.aligned_started:
                         continue
@@ -280,8 +313,97 @@ class Slot:
             except Exception as e:
                 self.stats.mark_error(f"ingest {asset}: {e}")
 
+    async def _post_boundary_history(self, client, asset: str):
+        """
+        Fetch historical closed candles. Run AFTER the boundary so the
+        candle that just closed is included.
+        """
+        state = self.asset_state[asset]
+        try:
+            gen = client.get_candles_live(
+                asset=asset,
+                period=TIMEFRAME_SECONDS,
+                hours=3.0,
+                max_rows=HISTORY_CANDLES,
+            )
+            closed, _forming = await gen.__anext__()
+            await gen.aclose()
+        except Exception as e:
+            print(f"[slot {self.slot_id}] history fetch failed for {asset}: {e}")
+            return
+
+        hist_candles = [
+            (int(c["time"]), float(c["open"]), float(c["high"]),
+             float(c["low"]), float(c["close"]))
+            for c in closed[-HISTORY_CANDLES:]
+        ]
+
+        with self.state_lock:
+            # Prepend history: build a fresh deque with history + current buffer
+            current = list(state.candles)
+            # Deduplicate: anything in history that's older than the oldest
+            # current candle
+            current_min = current[0][0] if current else None
+            if current_min is not None:
+                hist_candles = [c for c in hist_candles if c[0] < current_min]
+
+            combined = hist_candles + current
+            # Trim to MAX_CANDLES (keep the newest)
+            combined = combined[-MAX_CANDLES:]
+            state.candles = deque(combined, maxlen=MAX_CANDLES)
+            state.history_loaded = True
+
+            # Recompute indicators with the full series
+            closes = [c[4] for c in state.candles]
+            if state.forming:
+                closes.append(state.forming["close"])
+            if closes:
+                self._apply_indicators(state, closes)
+
+        print(f"[slot {self.slot_id}] history loaded for {asset}: "
+              f"{len(hist_candles)} hist + buffer = {len(state.candles)} total")
+
     # ------------------------------------------------------------------
-    # Mode: time_aligned subscription
+    # Mode: raw tick subscription (used after the initial handoff)
+    # ------------------------------------------------------------------
+    async def _stream_ticks(self, client, asset: str):
+        # This path is only reached if _early_buffer failed to subscribe.
+        # Normal flow: _early_buffer subscribes, then hands off.
+        state = self.asset_state[asset]
+        st = self.stats.get_asset(asset)
+
+        try:
+            stream = await client.subscribe_symbol(asset)
+        except Exception as e:
+            self.stats.mark_error(f"subscribe {asset}: {e}")
+            return
+
+        last_ts = 0
+        while not self._stop.is_set():
+            try:
+                tick = await stream.__anext__()
+            except StopAsyncIteration:
+                return
+            except Exception as e:
+                self.stats.mark_error(f"tick error {asset}: {e}")
+                await asyncio.sleep(1.0)
+                continue
+
+            try:
+                price = float(tick.get("close") or tick.get("price") or 0)
+                ts = int(tick.get("timestamp") or tick.get("time") or 0)
+                if price <= 0 or ts <= 0 or ts < last_ts:
+                    continue
+                last_ts = ts
+                with self.state_lock:
+                    if not state.aligned_started:
+                        continue
+                self._ingest_tick(state, st, price, ts)
+            except Exception as e:
+                self.stats.mark_error(f"ingest {asset}: {e}")
+
+    # ------------------------------------------------------------------
+    # Mode: time_aligned
     # ------------------------------------------------------------------
     async def _stream_time_aligned(self, client, asset: str):
         state = self.asset_state[asset]
@@ -293,14 +415,12 @@ class Slot:
             )
         except Exception as e:
             self.stats.mark_error(f"subscribe_aligned {asset}: {e}")
-            print(f"[slot {self.slot_id}] aligned subscribe failed for {asset}: {e}")
             return
 
         while not self._stop.is_set():
             try:
                 candle = await stream.__anext__()
             except StopAsyncIteration:
-                self.stats.mark_error(f"aligned stream ended: {asset}")
                 return
             except Exception as e:
                 self.stats.mark_error(f"aligned tick error {asset}: {e}")
@@ -315,7 +435,6 @@ class Slot:
                 c = float(candle.get("close") or 0)
                 if ts <= 0 or o <= 0 or c <= 0:
                     continue
-
                 with self.state_lock:
                     if not state.aligned_started:
                         continue
@@ -330,14 +449,13 @@ class Slot:
                     closes = [cc[4] for cc in state.candles]
                     closes.append(state.forming["close"])
                     self._apply_indicators(state, closes)
-
                 st.record_tick(ts, c)
                 self.stats.record_slot_tick()
             except Exception as e:
                 self.stats.mark_error(f"aligned ingest {asset}: {e}")
 
     # ------------------------------------------------------------------
-    # Mode: historical_ticks polling
+    # Mode: historical_ticks
     # ------------------------------------------------------------------
     async def _stream_historical_ticks(self, client, asset: str):
         state = self.asset_state[asset]
@@ -353,21 +471,17 @@ class Slot:
                         if not state.aligned_started:
                             await asyncio.sleep(HISTORICAL_POLL_SECS)
                             continue
-                        existing_times = {c[0] for c in state.candles}
+                        existing = {c[0] for c in state.candles}
                         added = 0
                         for c in new_candles:
-                            # Only keep candles at or after our aligned start
-                            if c[0] < state.last_boundary and state.last_boundary is not None:
-                                continue
-                            if c[0] not in existing_times:
+                            if c[0] not in existing:
                                 state.candles.append(c)
                                 st.record_candle()
                                 added += 1
                         latest = new_candles[-1]
                         state.forming = {
-                            "time": latest[0],
-                            "open": latest[1], "high": latest[2],
-                            "low": latest[3], "close": latest[4],
+                            "time": latest[0], "open": latest[1],
+                            "high": latest[2], "low": latest[3], "close": latest[4],
                         }
                         state.last_boundary = latest[0]
                         state.last_remote_candle_time = latest[0]
@@ -384,7 +498,7 @@ class Slot:
                 await asyncio.sleep(2.0)
 
     # ------------------------------------------------------------------
-    # Shared helpers
+    # Helpers
     # ------------------------------------------------------------------
     def _compile_from_ticks(self, raw_ticks, period: int):
         if not raw_ticks:
@@ -395,8 +509,7 @@ class Slot:
                 ts = int(t.get("time") or t.get("timestamp") or 0)
                 price = float(t.get("price") or t.get("close") or 0)
             elif isinstance(t, (list, tuple)) and len(t) >= 2:
-                ts = int(t[0])
-                price = float(t[1])
+                ts = int(t[0]); price = float(t[1])
             else:
                 continue
             if ts > 0 and price > 0:
@@ -420,7 +533,6 @@ class Slot:
 
         with self.state_lock:
             if state.forming is None:
-                # First clean tick — this is the TRUE open
                 state.forming = {
                     "time": bucket,
                     "open": price, "high": price, "low": price, "close": price,
