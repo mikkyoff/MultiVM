@@ -1,16 +1,13 @@
 """
-Performance tracking for multi-SSID streaming.
-Thread-safe counters + a ring buffer of periodic samples.
+Performance tracking. Counter-based tick rates. Adds mode + freshness.
 """
 
 import time
 import hashlib
 import threading
-from collections import deque, defaultdict
 
 
 def fingerprint(ssid: str) -> str:
-    """Short non-reversible fingerprint of an SSID, safe to log."""
     if not ssid:
         return "none"
     return hashlib.sha256(ssid.encode()).hexdigest()[:8]
@@ -19,23 +16,24 @@ def fingerprint(ssid: str) -> str:
 class AssetStats:
     __slots__ = (
         "ticks", "candles", "gaps", "last_close", "last_tick_ts",
-        "_tick_ts_60s", "tick_rate_60s",
+        "tick_rate_60s", "_window_start", "_window_ticks",
     )
 
     def __init__(self):
         self.ticks = 0
         self.candles = 0
-        self.gaps = 0           # buckets with 0 ticks after having ticks
+        self.gaps = 0
         self.last_close = None
         self.last_tick_ts = 0
-        self._tick_ts_60s = deque(maxlen=2000)  # last 60s of tick timestamps
         self.tick_rate_60s = 0.0
+        self._window_start = time.time()
+        self._window_ticks = 0
 
     def record_tick(self, ts: int, price: float):
         self.ticks += 1
+        self._window_ticks += 1
         self.last_close = price
         self.last_tick_ts = ts
-        self._tick_ts_60s.append(time.time())
 
     def record_candle(self):
         self.candles += 1
@@ -45,14 +43,11 @@ class AssetStats:
 
     def refresh_rate(self, window=60.0):
         now = time.time()
-        cutoff = now - window
-        # Count how many ticks happened in the last `window` seconds
-        n = 0
-        for t in reversed(self._tick_ts_60s):
-            if t < cutoff:
-                break
-            n += 1
-        self.tick_rate_60s = n / window
+        elapsed = now - self._window_start
+        if elapsed >= window:
+            self.tick_rate_60s = self._window_ticks / elapsed
+            self._window_ticks = 0
+            self._window_start = now
 
     def snapshot(self):
         return {
@@ -66,15 +61,11 @@ class AssetStats:
 
 
 class SlotStats:
-    """
-    Per-SSID slot stats. One slot = one PocketOptionAsync client,
-    handling N assets.
-    """
-
-    def __init__(self, slot_id: int, ssid: str, assets: list):
+    def __init__(self, slot_id: int, ssid: str, assets: list, mode: str = "ticks"):
         self.slot_id = slot_id
         self.ssid_fp = fingerprint(ssid)
         self.assets = list(assets)
+        self.mode = mode
         self.lock = threading.Lock()
 
         self.connected = False
@@ -88,11 +79,10 @@ class SlotStats:
 
         self.asset_stats = {a: AssetStats() for a in assets}
 
-        # Rolling 60s tick timestamps for the whole slot
-        self._tick_ts_60s = deque(maxlen=5000)
         self.slot_tick_rate_60s = 0.0
+        self._slot_window_start = time.time()
+        self._slot_window_ticks = 0
 
-    # --- slot level ---
     def mark_connected(self):
         with self.lock:
             if not self.connected:
@@ -122,27 +112,21 @@ class SlotStats:
             self.other_errors += 1
             self.last_error = str(reason)[:200]
 
-    # --- per asset ---
     def get_asset(self, asset: str) -> AssetStats:
         return self.asset_stats[asset]
 
-    # --- rollups ---
     def refresh_rates(self):
         now = time.time()
-        cutoff = now - 60.0
-        # slot-wide rate
-        n = 0
-        for t in reversed(self._tick_ts_60s):
-            if t < cutoff:
-                break
-            n += 1
-        self.slot_tick_rate_60s = n / 60.0
-        # per-asset
+        elapsed = now - self._slot_window_start
+        if elapsed >= 60.0:
+            self.slot_tick_rate_60s = self._slot_window_ticks / elapsed
+            self._slot_window_ticks = 0
+            self._slot_window_start = now
         for st in self.asset_stats.values():
             st.refresh_rate()
 
     def record_slot_tick(self):
-        self._tick_ts_60s.append(time.time())
+        self._slot_window_ticks += 1
 
     def uptime_pct(self):
         elapsed = time.time() - self.started_at
@@ -158,6 +142,7 @@ class SlotStats:
             return {
                 "slot_id": self.slot_id,
                 "ssid_fingerprint": self.ssid_fp,
+                "mode": self.mode,
                 "assets": self.assets,
                 "connected": self.connected,
                 "connected_since": self.connected_since,
@@ -172,12 +157,8 @@ class SlotStats:
 
 
 class PerfHistory:
-    """
-    Ring buffer of periodic snapshots. Keeps the last `maxlen` samples.
-    With maxlen=240 and a 30s interval, that's 2 hours of history.
-    """
-
-    def __init__(self, maxlen=240):
+    def __init__(self, maxlen=20):
+        from collections import deque
         self.samples = deque(maxlen=maxlen)
 
     def append(self, sample: dict):
