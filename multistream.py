@@ -1,9 +1,13 @@
 """
 Multi-SSID streaming manager.
-Supports three stream modes for candle sourcing:
-  - "ticks":            raw tick subscription, self-bucketed (original approach)
-  - "time_aligned":     subscribe_symbol_time_aligned (developer's suggestion)
-  - "historical_ticks": get_candles(asset, 1, N) polled on a timer (user's workaround)
+
+Candle building policy:
+  1. Connect and subscribe to raw ticks.
+  2. Fetch 150 historical closed candles for indicator seed (best-effort).
+  3. Wait until the next clean clock boundary (e.g. :00, :10, :20, :30, :40, :50).
+  4. Discard all ticks received before the boundary.
+  5. Start building candles from the first tick at/after the boundary.
+  6. Every subsequent candle boundary produces one completed candle.
 """
 
 import os
@@ -22,9 +26,9 @@ from indicators import recompute
 from perf import SlotStats, AssetStats
 
 
-TIMEFRAME_SECONDS = 120
-HISTORY_CANDLES = 150
-MAX_CANDLES = 100        # reduced from 300 as requested
+TIMEFRAME_SECONDS = 300
+HISTORY_CANDLES = 100
+MAX_CANDLES = 100
 
 RSI_PERIOD = 14
 BB_PERIOD = 20
@@ -32,8 +36,6 @@ BB_STD = 2.0
 EMA_PERIOD = 6
 
 SLOT_START_GAP_SECS = 5.0
-
-# How often historical_ticks mode polls the API
 HISTORICAL_POLL_SECS = 10
 
 
@@ -43,7 +45,8 @@ class AssetState:
         "rsi", "bb_upper", "bb_middle", "bb_lower",
         "bb_bandwidth", "bb_pct_to_upper", "bb_pct_to_lower",
         "ema", "ema_signal",
-        "last_remote_candle_time",   # for freshness tracking
+        "last_remote_candle_time",
+        "aligned_started",     # True once we've crossed the first clean boundary
     )
 
     def __init__(self, asset: str):
@@ -63,10 +66,12 @@ class AssetState:
         self.ema_signal = None
 
         self.last_remote_candle_time = None
+        self.aligned_started = False
 
     def snapshot(self):
         return {
             "asset": self.asset,
+            "aligned_started": self.aligned_started,
             "candles": [
                 {"time": t, "open": o, "high": h, "low": l, "close": c}
                 for (t, o, h, l, c) in self.candles
@@ -147,14 +152,32 @@ class Slot:
         )
         self.stats.mark_connected()
 
-        # Seed history (all modes fetch initial history the same way)
+        # ---- Seed history for indicator warm-up ----
         for asset in self.assets:
             try:
                 await self._seed_history(client, asset)
             except Exception as e:
                 print(f"[slot {self.slot_id}] seed {asset} failed: {e}")
 
-        # Route to the appropriate streaming loop
+        # ---- Wait until the next clean boundary ----
+        now = int(time.time())
+        next_boundary = ((now // TIMEFRAME_SECONDS) + 1) * TIMEFRAME_SECONDS
+        wait_secs = next_boundary - now
+        print(
+            f"[slot {self.slot_id}] waiting {wait_secs}s for next "
+            f"{TIMEFRAME_SECONDS}s boundary at {next_boundary}"
+        )
+        await asyncio.sleep(wait_secs + 0.2)  # +200ms safety margin
+
+        # Mark all assets as aligned
+        with self.state_lock:
+            for st in self.asset_state.values():
+                st.aligned_started = True
+                st.forming = None  # discard anything seeded during wait
+
+        print(f"[slot {self.slot_id}] boundary crossed — starting to build candles")
+
+        # ---- Subscribe and run the mode-specific stream ----
         if self.mode == "ticks":
             tasks = [asyncio.create_task(self._stream_ticks(client, a)) for a in self.assets]
         elif self.mode == "time_aligned":
@@ -175,95 +198,44 @@ class Slot:
                 pass
 
     # ------------------------------------------------------------------
-    # History seeding (shared by all modes)
+    # History seed
     # ------------------------------------------------------------------
     async def _seed_history(self, client, asset: str):
-        """
-        Fetch initial closed candles.
-        Prefer get_candles(asset, 1, N) then compile locally if the mode
-        is historical_ticks; otherwise use get_candles_live as before.
-        """
+        """Fetch historical closed candles for indicator warm-up."""
         state = self.asset_state[asset]
-
         try:
-            if self.mode == "historical_ticks":
-                # Use the user's approach: pull 1s ticks, compile locally
-                # Get enough ticks to cover HISTORY_CANDLES * TIMEFRAME_SECONDS
-                # (worst case: 1 tick per second -> HISTORY_CANDLES * TIMEFRAME_SECONDS ticks)
-                needed_ticks = min(HISTORY_CANDLES * TIMEFRAME_SECONDS, 3000)
-                raw = await client.get_candles(asset, 1, needed_ticks)
-                # raw is a list of {time, price} or similar
-                candles = self._compile_from_ticks(raw, TIMEFRAME_SECONDS)
-            else:
-                gen = client.get_candles_live(
-                    asset=asset,
-                    period=TIMEFRAME_SECONDS,
-                    hours=3.0,
-                    max_rows=HISTORY_CANDLES,
-                )
-                closed, _forming = await gen.__anext__()
-                await gen.aclose()
-                candles = [
-                    (int(c["time"]), float(c["open"]), float(c["high"]),
-                     float(c["low"]), float(c["close"]))
-                    for c in closed[-HISTORY_CANDLES:]
-                ]
+            gen = client.get_candles_live(
+                asset=asset,
+                period=TIMEFRAME_SECONDS,
+                hours=3.0,
+                max_rows=HISTORY_CANDLES,
+            )
+            closed, _forming = await gen.__anext__()
+            await gen.aclose()
         except Exception as e:
             print(f"[slot {self.slot_id}] history seed failed for {asset}: {e}")
             return
 
-        for c in candles:
-            state.candles.append(c)
+        for c in closed[-HISTORY_CANDLES:]:
+            state.candles.append((
+                int(c["time"]),
+                float(c["open"]),
+                float(c["high"]),
+                float(c["low"]),
+                float(c["close"]),
+            ))
 
         if state.candles:
             state.last_boundary = state.candles[-1][0]
-            state.last_remote_candle_time = state.candles[-1][0]
 
         closes = [c[4] for c in state.candles]
         if closes:
             self._apply_indicators(state, closes)
 
-        print(f"[slot {self.slot_id}] seeded {len(state.candles)} candles for {asset} (mode={self.mode})")
-
-    def _compile_from_ticks(self, raw_ticks, period: int):
-        """
-        Build OHLC candles from raw ticks.
-        raw_ticks: list of dicts (with 'time'/'timestamp' and 'price'/'close') or tuples.
-        """
-        if not raw_ticks:
-            return []
-
-        parsed = []
-        for t in raw_ticks:
-            if isinstance(t, dict):
-                ts = int(t.get("time") or t.get("timestamp") or 0)
-                price = float(t.get("price") or t.get("close") or 0)
-            elif isinstance(t, (list, tuple)) and len(t) >= 2:
-                ts = int(t[0])
-                price = float(t[1])
-            else:
-                continue
-            if ts > 0 and price > 0:
-                parsed.append((ts, price))
-
-        parsed.sort()
-        if not parsed:
-            return []
-
-        buckets = {}
-        for ts, price in parsed:
-            b = (ts // period) * period
-            if b not in buckets:
-                buckets[b] = [price, price, price, price]
-            else:
-                buckets[b][1] = max(buckets[b][1], price)
-                buckets[b][2] = min(buckets[b][2], price)
-                buckets[b][3] = price
-
-        return [(b, v[0], v[1], v[2], v[3]) for b, v in sorted(buckets.items())]
+        print(f"[slot {self.slot_id}] seeded {len(state.candles)} candles for {asset}")
 
     # ------------------------------------------------------------------
-    # Mode 1: raw tick subscription (original approach)
+    # Mode: raw tick subscription
     # ------------------------------------------------------------------
     async def _stream_ticks(self, client, asset: str):
         state = self.asset_state[asset]
@@ -276,7 +248,6 @@ class Slot:
             return
 
         last_ts = 0
-        stale_cutoff = TIMEFRAME_SECONDS * 2
 
         while not self._stop.is_set():
             try:
@@ -294,16 +265,23 @@ class Slot:
                 ts = int(tick.get("timestamp") or tick.get("time") or 0)
                 if price <= 0 or ts <= 0:
                     continue
-                now = int(time.time())
-                if ts < now - stale_cutoff or ts < last_ts:
+                if ts < last_ts:
                     continue
                 last_ts = ts
+
+                # Ignore ticks received before the aligned flag was set.
+                # (These would have been discarded by the boundary wait,
+                # but a stray late tick can still sneak in.)
+                with self.state_lock:
+                    if not state.aligned_started:
+                        continue
+
                 self._ingest_tick(state, st, price, ts)
             except Exception as e:
                 self.stats.mark_error(f"ingest {asset}: {e}")
 
     # ------------------------------------------------------------------
-    # Mode 2: subscribe_symbol_time_aligned (developer's suggestion)
+    # Mode: time_aligned subscription
     # ------------------------------------------------------------------
     async def _stream_time_aligned(self, client, asset: str):
         state = self.asset_state[asset]
@@ -318,7 +296,6 @@ class Slot:
             print(f"[slot {self.slot_id}] aligned subscribe failed for {asset}: {e}")
             return
 
-        # The aligned stream emits dicts with {time, open, high, low, close}
         while not self._stop.is_set():
             try:
                 candle = await stream.__anext__()
@@ -340,17 +317,16 @@ class Slot:
                     continue
 
                 with self.state_lock:
-                    # Append the completed candle
+                    if not state.aligned_started:
+                        continue
                     state.candles.append((ts, o, h, l, c))
                     st.record_candle()
-
                     state.forming = {
                         "time": ts + TIMEFRAME_SECONDS,
                         "open": c, "high": c, "low": c, "close": c,
                     }
                     state.last_boundary = ts
                     state.last_remote_candle_time = ts
-
                     closes = [cc[4] for cc in state.candles]
                     closes.append(state.forming["close"])
                     self._apply_indicators(state, closes)
@@ -361,7 +337,7 @@ class Slot:
                 self.stats.mark_error(f"aligned ingest {asset}: {e}")
 
     # ------------------------------------------------------------------
-    # Mode 3: historical_ticks (user's getdatatest.py approach)
+    # Mode: historical_ticks polling
     # ------------------------------------------------------------------
     async def _stream_historical_ticks(self, client, asset: str):
         state = self.asset_state[asset]
@@ -369,23 +345,24 @@ class Slot:
 
         while not self._stop.is_set():
             try:
-                # Fetch ~2x the tick count we need in a period
-                # On a 10s period, assume up to 20 ticks
                 raw = await client.get_candles(asset, 1, 50)
                 new_candles = self._compile_from_ticks(raw, TIMEFRAME_SECONDS)
 
                 if new_candles:
                     with self.state_lock:
-                        # Merge: only append candles we don't already have
+                        if not state.aligned_started:
+                            await asyncio.sleep(HISTORICAL_POLL_SECS)
+                            continue
                         existing_times = {c[0] for c in state.candles}
                         added = 0
                         for c in new_candles:
+                            # Only keep candles at or after our aligned start
+                            if c[0] < state.last_boundary and state.last_boundary is not None:
+                                continue
                             if c[0] not in existing_times:
                                 state.candles.append(c)
                                 st.record_candle()
                                 added += 1
-
-                        # Update forming candle to the newest bucket
                         latest = new_candles[-1]
                         state.forming = {
                             "time": latest[0],
@@ -394,11 +371,9 @@ class Slot:
                         }
                         state.last_boundary = latest[0]
                         state.last_remote_candle_time = latest[0]
-
                         closes = [cc[4] for cc in state.candles]
                         closes.append(state.forming["close"])
                         self._apply_indicators(state, closes)
-
                     if added:
                         st.record_tick(int(time.time()), latest[4])
                         self.stats.record_slot_tick()
@@ -409,13 +384,43 @@ class Slot:
                 await asyncio.sleep(2.0)
 
     # ------------------------------------------------------------------
-    # Shared: tick ingestion, indicators
+    # Shared helpers
     # ------------------------------------------------------------------
+    def _compile_from_ticks(self, raw_ticks, period: int):
+        if not raw_ticks:
+            return []
+        parsed = []
+        for t in raw_ticks:
+            if isinstance(t, dict):
+                ts = int(t.get("time") or t.get("timestamp") or 0)
+                price = float(t.get("price") or t.get("close") or 0)
+            elif isinstance(t, (list, tuple)) and len(t) >= 2:
+                ts = int(t[0])
+                price = float(t[1])
+            else:
+                continue
+            if ts > 0 and price > 0:
+                parsed.append((ts, price))
+        parsed.sort()
+        if not parsed:
+            return []
+        buckets = {}
+        for ts, price in parsed:
+            b = (ts // period) * period
+            if b not in buckets:
+                buckets[b] = [price, price, price, price]
+            else:
+                buckets[b][1] = max(buckets[b][1], price)
+                buckets[b][2] = min(buckets[b][2], price)
+                buckets[b][3] = price
+        return [(b, v[0], v[1], v[2], v[3]) for b, v in sorted(buckets.items())]
+
     def _ingest_tick(self, state: AssetState, st: AssetStats, price: float, ts: int):
         bucket = (ts // TIMEFRAME_SECONDS) * TIMEFRAME_SECONDS
 
         with self.state_lock:
             if state.forming is None:
+                # First clean tick — this is the TRUE open
                 state.forming = {
                     "time": bucket,
                     "open": price, "high": price, "low": price, "close": price,
@@ -425,7 +430,6 @@ class Slot:
                 gap_buckets = (bucket - state.last_boundary) // TIMEFRAME_SECONDS - 1
                 if gap_buckets > 0:
                     st.gaps += gap_buckets
-
                 f = state.forming
                 state.candles.append((f["time"], f["open"], f["high"], f["low"], f["close"]))
                 st.record_candle()
@@ -471,10 +475,6 @@ class Slot:
 
 class MultiStreamManager:
     def __init__(self, vm_role: str, slots_config: List[Tuple[str, List[str], str]]):
-        """
-        slots_config: list of (ssid, assets, mode)
-        mode: "ticks" | "time_aligned" | "historical_ticks"
-        """
         self.vm_role = vm_role
         self.slots: List[Slot] = []
         for i, (ssid, assets, mode) in enumerate(slots_config, start=1):
