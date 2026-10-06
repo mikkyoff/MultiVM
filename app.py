@@ -38,8 +38,8 @@ def _mode(env_key, default="ticks"):
 if VM_ROLE == "A":
     # VM A: control — all three slots use raw tick mode (baseline)
     SLOTS_CONFIG = [
-        (os.getenv("SSID_VM1_SLOT1"), ["MARA_otc", "GME_otc"], _mode("SSID_VM1_SLOT1_MODE")),
-        (os.getenv("SSID_VM1_SLOT2"), ["EURRUB_otc", "LINK_otc"], _mode("SSID_VM1_SLOT2_MODE")),
+        (os.getenv("SSID_VM1_SLOT1"), ["MARA_otc", "GME_otc", "XAUUSD_otc"], _mode("SSID_VM1_SLOT1_MODE")),
+        (os.getenv("SSID_VM1_SLOT2"), ["NGNUSD_otc", "AUS200_otc"], _mode("SSID_VM1_SLOT2_MODE")),
         (os.getenv("SSID_VM1_SLOT3"), ["MATIC_otc", "TON-USD_otc"], _mode("SSID_VM1_SLOT3_MODE")),
     ]
 elif VM_ROLE == "B":
