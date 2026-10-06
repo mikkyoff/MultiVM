@@ -38,8 +38,8 @@ def _mode(env_key, default="ticks"):
 if VM_ROLE == "A":
     # VM A: control — all three slots use raw tick mode (baseline)
     SLOTS_CONFIG = [
-        (os.getenv("SSID_VM1_SLOT1"), ["MARA_otc", "GME_otc", "PLTR_otc"], _mode("SSID_VM1_SLOT1_MODE")),
-        (os.getenv("SSID_VM1_SLOT2"), ["EURRUB_otc", "LINK_otc", "SOL-USD_otc"], _mode("SSID_VM1_SLOT2_MODE")),
+        (os.getenv("SSID_VM1_SLOT1"), ["MARA_otc", "GME_otc"], _mode("SSID_VM1_SLOT1_MODE")),
+        (os.getenv("SSID_VM1_SLOT2"), ["EURRUB_otc", "LINK_otc"], _mode("SSID_VM1_SLOT2_MODE")),
         (os.getenv("SSID_VM1_SLOT3"), ["MATIC_otc", "TON-USD_otc"], _mode("SSID_VM1_SLOT3_MODE")),
     ]
 elif VM_ROLE == "B":
@@ -48,8 +48,8 @@ elif VM_ROLE == "B":
     #   slot 2 → time_aligned (developer suggestion)
     #   slot 3 → historical_ticks (user workaround)
     SLOTS_CONFIG = [
-        (os.getenv("SSID_VM2_SLOT1"), ["UKBrent_otc", "USCrude_otc", "#XOM_otc"], _mode("SSID_VM2_SLOT1_MODE", "ticks")),
-        (os.getenv("SSID_VM2_SLOT2"), ["SP500_otc", "BITB_otc", "XAGUSD_otc"], _mode("SSID_VM2_SLOT2_MODE", "time_aligned")),
+        (os.getenv("SSID_VM2_SLOT1"), ["UKBrent_otc", "USCrude_otc"], _mode("SSID_VM2_SLOT1_MODE", "ticks")),
+        (os.getenv("SSID_VM2_SLOT2"), ["SP500_otc", "BITB_otc"], _mode("SSID_VM2_SLOT2_MODE", "time_aligned")),
         (os.getenv("SSID_VM2_SLOT3"), ["XAUUSD_otc", "XNGUSD_otc"], _mode("SSID_VM2_SLOT3_MODE", "historical_ticks")),
     ]
 else:
