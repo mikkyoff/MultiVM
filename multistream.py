@@ -1,14 +1,18 @@
 """
-Multi-SSID streaming manager — pure live candle building.
+Multi-SSID streaming manager — scaled for many slots per VM.
 
 Flow per slot:
   1. Connect to PocketOption.
-  2. Subscribe to all asset tick streams immediately (ticks are discarded
-     until the boundary is crossed — this keeps the socket warm).
+  2. Subscribe to all asset tick streams immediately.
   3. Wait until the next clean clock boundary on TIMEFRAME_SECONDS.
-  4. At the boundary, flip the alignment flag.
-  5. Every tick after that builds a candle. Candles close at every boundary.
-  6. No historical fetch. Candle count grows over time.
+  4. Discard ticks until the boundary is crossed.
+  5. Build candles live from the boundary onward.
+
+Memory optimizations for large slot counts:
+  - Candles stored as tuples (not dicts)
+  - MAX_CANDLES reduced
+  - Per-tick deques removed (counter-based rates)
+  - Slot snapshot serializes lazily
 """
 
 import os
@@ -17,7 +21,6 @@ import threading
 import time
 import random
 from collections import deque
-from datetime import timedelta
 from typing import Dict, List, Tuple
 
 from BinaryOptionsToolsV2 import PocketOptionAsync
@@ -35,10 +38,9 @@ BB_PERIOD = 20
 BB_STD = 2.0
 EMA_PERIOD = 6
 
+# Spread slot startups further apart when many slots
 SLOT_START_GAP_SECS = 5.0
 
-# If the next boundary is closer than this many seconds, skip it and
-# wait for the one after — gives the connection time to settle.
 MIN_MARGIN_BEFORE_BOUNDARY = 3.0
 
 
@@ -48,13 +50,12 @@ class AssetState:
         "rsi", "bb_upper", "bb_middle", "bb_lower",
         "bb_bandwidth", "bb_pct_to_upper", "bb_pct_to_lower",
         "ema", "ema_signal",
-        "aligned_started",
-        "aligned_at",
+        "aligned_started", "aligned_at",
     )
 
     def __init__(self, asset: str):
         self.asset = asset
-        self.candles = deque(maxlen=MAX_CANDLES)  # tuples: (t, o, h, l, c)
+        self.candles = deque(maxlen=MAX_CANDLES)
         self.forming = None
         self.last_boundary = None
 
@@ -115,7 +116,7 @@ class Slot:
     def start(self):
         self.thread = threading.Thread(
             target=self._run_thread, daemon=True,
-            name=f"slot-{self.slot_id}-{self.mode}",
+            name=f"slot-{self.slot_id}",
         )
         self.thread.start()
 
@@ -133,14 +134,11 @@ class Slot:
                 pass
 
     async def _main(self):
-        # Small random jitter so slots don't all connect on the same second
         await asyncio.sleep(random.uniform(0, 2))
 
         if not self.ssid:
             self.stats.mark_error("SSID not set for this slot")
             return
-
-        print(f"[slot {self.slot_id}] mode={self.mode} ssid_len={len(self.ssid)}")
 
         config = Config(timeout_secs=30, terminal_logging=False)
         try:
@@ -154,36 +152,26 @@ class Slot:
 
         print(
             f"[slot {self.slot_id}] connected fp={self.stats.ssid_fp} "
-            f"balance={balance} demo={client.is_demo()} assets={self.assets}"
+            f"balance={balance} assets={len(self.assets)}"
         )
         self.stats.mark_connected()
 
-        # ---- Compute target boundary with safety margin ----
         target_boundary = self._compute_target_boundary()
         wait_secs = target_boundary - time.time()
-        print(
-            f"[slot {self.slot_id}] waiting {wait_secs:.1f}s for boundary at "
-            f"{int(target_boundary)}"
-        )
+        print(f"[slot {self.slot_id}] waiting {wait_secs:.1f}s for boundary")
 
-        # ---- Subscribe to all assets BEFORE the boundary so sockets are warm ----
+        # Subscribe before boundary
         streams: Dict[str, object] = {}
         for asset in self.assets:
             try:
                 streams[asset] = await client.subscribe_symbol(asset)
             except Exception as e:
                 self.stats.mark_error(f"subscribe {asset}: {e}")
-                print(f"[slot {self.slot_id}] subscribe {asset} failed: {e}")
 
-        print(f"[slot {self.slot_id}] {len(streams)} streams subscribed, "
-              f"discarding ticks until boundary")
-
-        # ---- Sit idle until the boundary. Discard all incoming ticks. ----
-        # We consume the streams in parallel but don't ingest anything.
+        # Discard until boundary
         discard_deadline = target_boundary
 
-        async def discard_stream(asset, stream):
-            """Drain ticks until deadline, then stop."""
+        async def discard_stream(stream):
             while time.time() < discard_deadline and not self._stop.is_set():
                 try:
                     await asyncio.wait_for(stream.__anext__(), timeout=0.5)
@@ -194,26 +182,23 @@ class Slot:
                 except Exception:
                     await asyncio.sleep(0.1)
 
-        discard_tasks = [
-            asyncio.create_task(discard_stream(a, s))
-            for a, s in streams.items()
-        ]
-        await asyncio.gather(*discard_tasks, return_exceptions=True)
+        await asyncio.gather(
+            *[asyncio.create_task(discard_stream(s)) for s in streams.values()],
+            return_exceptions=True,
+        )
 
-        # ---- Cross the boundary ----
         now = int(time.time())
-        print(f"[slot {self.slot_id}] boundary crossed at {now} — starting live build")
+        print(f"[slot {self.slot_id}] boundary crossed at {now}")
         with self.state_lock:
             for st in self.asset_state.values():
                 st.aligned_started = True
                 st.aligned_at = now
                 st.forming = None
 
-        # ---- Now switch to real ingestion ----
-        tasks = []
-        for asset, stream in streams.items():
-            tasks.append(asyncio.create_task(self._ingest_loop(asset, stream)))
-
+        tasks = [
+            asyncio.create_task(self._ingest_loop(asset, stream))
+            for asset, stream in streams.items()
+        ]
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
@@ -233,7 +218,6 @@ class Slot:
     async def _ingest_loop(self, asset: str, stream):
         state = self.asset_state[asset]
         st = self.stats.get_asset(asset)
-
         last_ts = 0
 
         while not self._stop.is_set():
@@ -250,10 +234,8 @@ class Slot:
             try:
                 price = float(tick.get("close") or tick.get("price") or 0)
                 ts = int(tick.get("timestamp") or tick.get("time") or 0)
-                if price <= 0 or ts <= 0:
+                if price <= 0 or ts <= 0 or ts < last_ts:
                     continue
-                if ts < last_ts:
-                    continue  # ignore out-of-order
                 last_ts = ts
 
                 with self.state_lock:
@@ -269,35 +251,28 @@ class Slot:
 
         with self.state_lock:
             if state.forming is None:
-                # First tick after the boundary — true open
                 state.forming = {
                     "time": bucket,
                     "open": price, "high": price, "low": price, "close": price,
                 }
                 state.last_boundary = bucket
             elif bucket > state.last_boundary:
-                # Close out the previous candle
                 gap_buckets = (bucket - state.last_boundary) // TIMEFRAME_SECONDS - 1
                 if gap_buckets > 0:
                     st.gaps += gap_buckets
-
                 f = state.forming
                 state.candles.append((f["time"], f["open"], f["high"], f["low"], f["close"]))
                 st.record_candle()
-
-                # Start the new candle
                 state.last_boundary = bucket
                 state.forming = {
                     "time": bucket,
                     "open": price, "high": price, "low": price, "close": price,
                 }
             else:
-                # Update current forming candle
                 state.forming["high"] = max(state.forming["high"], price)
                 state.forming["low"] = min(state.forming["low"], price)
                 state.forming["close"] = price
 
-            # Recompute indicators on every tick (closed + current forming)
             closes = [c[4] for c in state.candles]
             closes.append(state.forming["close"])
             self._apply_indicators(state, closes)
