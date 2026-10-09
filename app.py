@@ -1,9 +1,11 @@
 """
-Multi-SSID Pocket Option streaming service.
+Multi-SSID Pocket Option streaming service with per-slot proxy support.
 
-Supports two profiles:
-  - VM_PROFILE=light  → 10 slots (20 assets) per VM — safe starting point
-  - VM_PROFILE=full   → 15 slots (30 assets) per VM — memory-tight
+Profile layout for this run:
+  VM A (Service A): 10 SSIDs, 20 assets, 5 proxies (2 SSIDs per proxy)
+  VM B (Service B): 10 SSIDs, 20 assets, 5 proxies (2 SSIDs per proxy)
+
+Timeframe: 1 minute (60s).
 """
 
 import os
@@ -25,63 +27,78 @@ CORS(app)
 
 VM_ROLE = os.getenv("VM_ROLE", "A").upper()
 STARTUP_DELAY_SECS = float(os.getenv("STARTUP_DELAY_SECS", "0"))
-VM_PROFILE = os.getenv("VM_PROFILE", "light").strip().lower()
 
 
-# =====================================================================
-# VM A (demo) — stocks, crypto, forex
-# =====================================================================
-VM_A_FULL = [
-    (os.getenv("SSID_A_01"), ["MARA_otc", "GME_otc"],            "ticks"),
-    (os.getenv("SSID_A_02"), ["PLTR_otc", "BITB_otc"],           "ticks"),
-    (os.getenv("SSID_A_03"), ["EURRUB_otc", "USDCNH_otc"],       "ticks"),
-    (os.getenv("SSID_A_04"), ["LINK_otc", "DOTUSD_otc"],         "ticks"),
-    (os.getenv("SSID_A_05"), ["SOL-USD_otc", "ADA-USD_otc"],     "ticks"),
-    (os.getenv("SSID_A_06"), ["MATIC_otc", "TON-USD_otc"],       "ticks"),
-    (os.getenv("SSID_A_07"), ["BTCUSD_otc", "ETHUSD_otc"],       "ticks"),
-    (os.getenv("SSID_A_08"), ["BNB-USD_otc", "LTCUSD_otc"],      "ticks"),
-    (os.getenv("SSID_A_09"), ["TRX-USD_otc", "DOGE_otc"],        "ticks"),
-    (os.getenv("SSID_A_10"), ["EURUSD_otc", "GBPUSD_otc"],       "ticks"),
-    (os.getenv("SSID_A_11"), ["USDJPY_otc", "USDCAD_otc"],       "ticks"),
-    (os.getenv("SSID_A_12"), ["AUDUSD_otc", "NZDUSD_otc"],       "ticks"),
-    (os.getenv("SSID_A_13"), ["USDCHF_otc", "USDINR_otc"],       "ticks"),
-    (os.getenv("SSID_A_14"), ["USDRUB_otc", "USDVND_otc"],       "ticks"),
-    (os.getenv("SSID_A_15"), ["USDPKR_otc", "USDBRL_otc"],       "ticks"),
+def _proxy_url(host: str, port: str, user: str, pw: str) -> str:
+    """Build an HTTP proxy URL from parts. Returns '' if any part missing."""
+    if not all([host, port, user, pw]):
+        return ""
+    return f"http://{user}:{pw}@{host}:{port}"
+
+
+def _env_proxy(prefix: str) -> str:
+    return _proxy_url(
+        os.getenv(f"{prefix}_HOST", "").strip(),
+        os.getenv(f"{prefix}_PORT", "").strip(),
+        os.getenv(f"{prefix}_USER", "").strip(),
+        os.getenv(f"{prefix}_PASS", "").strip(),
+    )
+
+
+# ---------------------------------------------------------------------
+# Proxies (5 for VM A, 5 for VM B)
+# ---------------------------------------------------------------------
+PROXY_A_01 = _env_proxy("PROXY_A_01")
+PROXY_A_02 = _env_proxy("PROXY_A_02")
+PROXY_A_03 = _env_proxy("PROXY_A_03")
+PROXY_A_04 = _env_proxy("PROXY_A_04")
+PROXY_A_05 = _env_proxy("PROXY_A_05")
+
+PROXY_B_01 = _env_proxy("PROXY_B_01")
+PROXY_B_02 = _env_proxy("PROXY_B_02")
+PROXY_B_03 = _env_proxy("PROXY_B_03")
+PROXY_B_04 = _env_proxy("PROXY_B_04")
+PROXY_B_05 = _env_proxy("PROXY_B_05")
+
+
+# ---------------------------------------------------------------------
+# VM A slot config: 10 SSIDs, 2 per proxy, 2 assets per SSID
+# ---------------------------------------------------------------------
+VM_A_SLOTS = [
+    (os.getenv("SSID_A_01"), ["MARA_otc", "GME_otc"],           "ticks", PROXY_A_01),
+    (os.getenv("SSID_A_02"), ["PLTR_otc", "BITB_otc"],          "ticks", PROXY_A_01),
+    (os.getenv("SSID_A_03"), ["EURRUB_otc", "USDCNH_otc"],      "ticks", PROXY_A_02),
+    (os.getenv("SSID_A_04"), ["LINK_otc", "DOTUSD_otc"],        "ticks", PROXY_A_02),
+    (os.getenv("SSID_A_05"), ["SOL-USD_otc", "ADA-USD_otc"],    "ticks", PROXY_A_03),
+    (os.getenv("SSID_A_06"), ["MATIC_otc", "TON-USD_otc"],      "ticks", PROXY_A_03),
+    (os.getenv("SSID_A_07"), ["BTCUSD_otc", "ETHUSD_otc"],      "ticks", PROXY_A_04),
+    (os.getenv("SSID_A_08"), ["BNB-USD_otc", "LTCUSD_otc"],     "ticks", PROXY_A_04),
+    (os.getenv("SSID_A_09"), ["TRX-USD_otc", "DOGE_otc"],       "ticks", PROXY_A_05),
+    (os.getenv("SSID_A_10"), ["EURUSD_otc", "GBPUSD_otc"],      "ticks", PROXY_A_05),
 ]
 
-# =====================================================================
-# VM B (demo) — commodities, indices, more stocks
-# =====================================================================
-VM_B_FULL = [
-    (os.getenv("SSID_B_01"), ["UKBrent_otc", "USCrude_otc"],     "ticks"),
-    (os.getenv("SSID_B_02"), ["XNGUSD_otc", "XPTUSD_otc"],       "ticks"),
-    (os.getenv("SSID_B_03"), ["XAUUSD_otc", "XAGUSD_otc"],       "ticks"),
-    (os.getenv("SSID_B_04"), ["XPDUSD_otc", "USDCAD_otc"],       "ticks"),
-    (os.getenv("SSID_B_05"), ["SP500_otc", "NASUSD_otc"],        "ticks"),
-    (os.getenv("SSID_B_06"), ["DJI30_otc", "JPN225_otc"],        "ticks"),
-    (os.getenv("SSID_B_07"), ["AUS200_otc", "D30EUR_otc"],       "ticks"),
-    (os.getenv("SSID_B_08"), ["E35EUR_otc", "E50EUR_otc"],       "ticks"),
-    (os.getenv("SSID_B_09"), ["F40EUR_otc", "CITI_otc"],         "ticks"),
-    (os.getenv("SSID_B_10"), ["#AAPL_otc", "#MSFT_otc"],         "ticks"),
-    (os.getenv("SSID_B_11"), ["#TSLA_otc", "#INTC_otc"],         "ticks"),
-    (os.getenv("SSID_B_12"), ["AMZN_otc", "NFLX_otc"],           "ticks"),
-    (os.getenv("SSID_B_13"), ["BABA_otc", "TWITTER_otc"],        "ticks"),
-    (os.getenv("SSID_B_14"), ["#JNJ_otc", "#MCD_otc"],           "ticks"),
-    (os.getenv("SSID_B_15"), ["#PFE_otc", "FDX_otc"],            "ticks"),
+
+# ---------------------------------------------------------------------
+# VM B slot config: 10 SSIDs, 2 per proxy, 2 assets per SSID
+# ---------------------------------------------------------------------
+VM_B_SLOTS = [
+    (os.getenv("SSID_B_01"), ["UKBrent_otc", "USCrude_otc"],    "ticks", PROXY_B_01),
+    (os.getenv("SSID_B_02"), ["XNGUSD_otc", "XPTUSD_otc"],      "ticks", PROXY_B_01),
+    (os.getenv("SSID_B_03"), ["XAUUSD_otc", "XAGUSD_otc"],      "ticks", PROXY_B_02),
+    (os.getenv("SSID_B_04"), ["XPDUSD_otc", "USDCAD_otc"],      "ticks", PROXY_B_02),
+    (os.getenv("SSID_B_05"), ["SP500_otc", "NASUSD_otc"],       "ticks", PROXY_B_03),
+    (os.getenv("SSID_B_06"), ["DJI30_otc", "JPN225_otc"],       "ticks", PROXY_B_03),
+    (os.getenv("SSID_B_07"), ["AUS200_otc", "D30EUR_otc"],      "ticks", PROXY_B_04),
+    (os.getenv("SSID_B_08"), ["E35EUR_otc", "E50EUR_otc"],      "ticks", PROXY_B_04),
+    (os.getenv("SSID_B_09"), ["F40EUR_otc", "CITI_otc"],        "ticks", PROXY_B_05),
+    (os.getenv("SSID_B_10"), ["#AAPL_otc", "#MSFT_otc"],        "ticks", PROXY_B_05),
 ]
-
-
-def _pick_profile(full_list):
-    if VM_PROFILE == "full":
-        return full_list
-    # light: first 10 slots
-    return full_list[:10]
 
 
 if VM_ROLE == "A":
-    SLOTS_CONFIG = _pick_profile(VM_A_FULL)
+    SLOTS_CONFIG = VM_A_SLOTS
 elif VM_ROLE == "B":
-    SLOTS_CONFIG = _pick_profile(VM_B_FULL)
+    SLOTS_CONFIG = VM_B_SLOTS
 else:
     raise RuntimeError(f"Unknown VM_ROLE: {VM_ROLE}")
 
@@ -116,7 +133,7 @@ def _memory_maintenance():
                 pass
         except Exception as e:
             print(f"[maint] error: {e}")
-        time.sleep(1800)  # 30 min now — more aggressive for 15 slots
+        time.sleep(1800)
 
 
 def _startup():
@@ -134,7 +151,6 @@ def index():
 def get_candles():
     return jsonify({
         "vm_role": VM_ROLE,
-        "vm_profile": VM_PROFILE,
         "timeframe": TIMEFRAME_SECONDS,
         "server_time": int(time.time()),
         "data": manager.snapshot_all(),
@@ -146,7 +162,6 @@ def get_perf():
     manager.refresh_rates()
     return jsonify({
         "vm_role": VM_ROLE,
-        "vm_profile": VM_PROFILE,
         "uptime_seconds": int(time.time() - _START_TS),
         "data": manager.snapshot_stats(),
     })
@@ -162,7 +177,6 @@ def health():
     return jsonify({
         "status": "ok",
         "vm_role": VM_ROLE,
-        "vm_profile": VM_PROFILE,
         "slot_count": len(SLOTS_CONFIG),
     })
 
