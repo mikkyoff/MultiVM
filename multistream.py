@@ -1,18 +1,12 @@
 """
-Multi-SSID streaming manager — scaled for many slots per VM.
+Multi-SSID streaming manager with optional per-slot proxy support.
 
-Flow per slot:
-  1. Connect to PocketOption.
-  2. Subscribe to all asset tick streams immediately.
-  3. Wait until the next clean clock boundary on TIMEFRAME_SECONDS.
-  4. Discard ticks until the boundary is crossed.
-  5. Build candles live from the boundary onward.
-
-Memory optimizations for large slot counts:
-  - Candles stored as tuples (not dicts)
-  - MAX_CANDLES reduced
-  - Per-tick deques removed (counter-based rates)
-  - Slot snapshot serializes lazily
+Slot config: (ssid, assets, mode, proxy_url)
+  - ssid:      the PocketOption session ID
+  - assets:    list of asset symbols
+  - mode:      "ticks" (only mode used here)
+  - proxy_url: optional HTTP proxy URL, e.g.
+               "http://user:pass@host:port"
 """
 
 import os
@@ -21,7 +15,7 @@ import threading
 import time
 import random
 from collections import deque
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from BinaryOptionsToolsV2 import PocketOptionAsync
 from BinaryOptionsToolsV2.config import Config
@@ -30,7 +24,7 @@ from indicators import recompute
 from perf import SlotStats, AssetStats
 
 
-TIMEFRAME_SECONDS = 10
+TIMEFRAME_SECONDS = 60        # 1-minute candles
 MAX_CANDLES = 100
 
 RSI_PERIOD = 14
@@ -38,10 +32,8 @@ BB_PERIOD = 20
 BB_STD = 2.0
 EMA_PERIOD = 6
 
-# Spread slot startups further apart when many slots
-SLOT_START_GAP_SECS = 5.0
-
-MIN_MARGIN_BEFORE_BOUNDARY = 3.0
+SLOT_START_GAP_SECS = 8.0     # wider spacing when proxied
+MIN_MARGIN_BEFORE_BOUNDARY = 5.0
 
 
 class AssetState:
@@ -102,11 +94,19 @@ class AssetState:
 
 
 class Slot:
-    def __init__(self, slot_id: int, ssid: str, assets: List[str], mode: str = "ticks"):
+    def __init__(
+        self,
+        slot_id: int,
+        ssid: str,
+        assets: List[str],
+        mode: str = "ticks",
+        proxy_url: Optional[str] = None,
+    ):
         self.slot_id = slot_id
         self.ssid = ssid
         self.assets = assets
         self.mode = mode
+        self.proxy_url = proxy_url
         self.stats = SlotStats(slot_id, ssid, assets, mode=mode)
         self.asset_state: Dict[str, AssetState] = {a: AssetState(a) for a in assets}
         self.state_lock = threading.Lock()
@@ -140,10 +140,21 @@ class Slot:
             self.stats.mark_error("SSID not set for this slot")
             return
 
-        config = Config(timeout_secs=30, terminal_logging=False)
+        # ---- Build config with optional proxy ----
+        if self.proxy_url:
+            config = Config(
+                timeout_secs=60,
+                terminal_logging=False,
+                proxy=self.proxy_url,
+            )
+            proxy_fp = self.proxy_url.split("@")[-1] if "@" in self.proxy_url else self.proxy_url
+            print(f"[slot {self.slot_id}] using proxy {proxy_fp}")
+        else:
+            config = Config(timeout_secs=30, terminal_logging=False)
+
         try:
             client = PocketOptionAsync(self.ssid, config=config)
-            await client.wait_for_assets(timeout=60.0)
+            await client.wait_for_assets(timeout=90.0)
             balance = await client.balance()
         except Exception as e:
             self.stats.mark_auth_failure(str(e))
@@ -160,7 +171,6 @@ class Slot:
         wait_secs = target_boundary - time.time()
         print(f"[slot {self.slot_id}] waiting {wait_secs:.1f}s for boundary")
 
-        # Subscribe before boundary
         streams: Dict[str, object] = {}
         for asset in self.assets:
             try:
@@ -168,7 +178,6 @@ class Slot:
             except Exception as e:
                 self.stats.mark_error(f"subscribe {asset}: {e}")
 
-        # Discard until boundary
         discard_deadline = target_boundary
 
         async def discard_stream(stream):
@@ -298,17 +307,25 @@ class Slot:
         return {
             "slot_id": self.slot_id,
             "mode": self.mode,
+            "proxy": self.proxy_url.split("@")[-1] if self.proxy_url else None,
             "assets": assets_snap,
             "stats": self.stats.snapshot(),
         }
 
 
 class MultiStreamManager:
-    def __init__(self, vm_role: str, slots_config: List[Tuple[str, List[str], str]]):
+    def __init__(
+        self,
+        vm_role: str,
+        slots_config: List[Tuple[str, List[str], str, Optional[str]]],
+    ):
+        """slots_config: (ssid, assets, mode, proxy_url)"""
         self.vm_role = vm_role
         self.slots: List[Slot] = []
-        for i, (ssid, assets, mode) in enumerate(slots_config, start=1):
-            self.slots.append(Slot(slot_id=i, ssid=ssid or "", assets=assets, mode=mode))
+        for i, (ssid, assets, mode, proxy) in enumerate(slots_config, start=1):
+            self.slots.append(
+                Slot(slot_id=i, ssid=ssid or "", assets=assets, mode=mode, proxy_url=proxy)
+            )
 
     def start(self, startup_delay_secs: float = 0.0):
         def _run():
